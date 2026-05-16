@@ -9,6 +9,7 @@ const path = require('path');
 const CONFIG = {
   EPIC_DIR: 'epics',
   TASK_DIR: 'tasks',
+  FEATURE_SLICE_DIR: 'feature-slices',
   INDEX_FILE: '.agent-task-index.json',
   VALID_STATUSES: ['open', 'in_progress', 'in_review', 'done'],
   DONE_STATUS: 'done',
@@ -73,7 +74,8 @@ function parseArgs(argv) {
     verbose: false,
     help: false,
     epic: null,
-    noEpic: false
+    featureSlice: null,
+    noParent: false
   };
 
   const optionStartIndex = args[0] && !args[0].startsWith('--') ? 1 : 0;
@@ -93,15 +95,22 @@ function parseArgs(argv) {
       }
       options.epic = value;
       i += 1;
-    } else if (arg === '--no-epic') {
-      options.noEpic = true;
+    } else if (arg === '--feature-slice') {
+      const value = args[i + 1];
+      if (!value || value.startsWith('--')) {
+        throw new Error('--feature-slice requires ID');
+      }
+      options.featureSlice = value;
+      i += 1;
+    } else if (arg === '--no-parent') {
+      options.noParent = true;
     } else {
       throw new Error(`Unknown option: ${arg}`);
     }
   }
 
-  if (options.epic && options.noEpic) {
-    throw new Error('--epic and --no-epic cannot be used together.');
+  if (options.epic && options.noParent) {
+    throw new Error('--epic and --no-parent cannot be used together.');
   }
 
   return { command, options };
@@ -233,10 +242,30 @@ function parseEpicFile(filePath) {
   };
 }
 
+function parseFeatureSliceFile(filePath) {
+  const allowedKeys = ['id','type','title','status','epic_id','updated_at'];
+  const meta = parseFrontmatter(readText(filePath), filePath, allowedKeys);
+  validateCommonMetadata(meta, 'feature-slice', filePath);
+
+  if (!meta.epic_id) {
+    throw new Error(`FeatureSlice missing epic_id: ${filePath}`);
+  }
+
+  return {
+    ...meta,
+    type: 'feature-slice',
+    path: toPosixPath(filePath)
+  };
+}
+
 function parseTaskFile(filePath) {
-  const allowedKeys = ['id', 'type', 'title', 'status', 'epic_id', 'updated_at'];
+  const allowedKeys = ['id','type','title','status','epic_id','feature_slice_id','updated_at'];
   const meta = parseFrontmatter(readText(filePath), filePath, allowedKeys);
   validateCommonMetadata(meta, 'task', filePath);
+
+  if (!!meta.epic_id && !!meta.feature_slice_id) {
+    throw new Error(`Task must have exactly one of epic_id or feature_slice_id: ${filePath}`);
+  }
 
   const task = {
     ...meta,
@@ -282,6 +311,24 @@ function validateEpicReferences(epics, tasks) {
   if (0 < errors.length) throw new ValidationError(errors);
 }
 
+function validateFeatureSliceReferences(epics, feature_slices, tasks) {
+  const epicIds = new Set(epics.map(e => e.id));
+  const fsIds = new Set(feature_slices.map(f => f.id));
+  const errors = [];
+
+  for (const fs of feature_slices) {
+    if (!epicIds.has(fs.epic_id)) {
+        errors.push(`FeatureSlice '${fs.id}' references missing Epic '${fs.epic_id}'`);
+    }
+  }
+  for (const task of tasks) {
+    if (task.feature_slice_id && !fsIds.has(task.feature_slice_id)) {
+        errors.push(`Task '${task.id}' references missing FeatureSlice '${task.feature_slice_id}'`);
+    }
+  }
+  if (0 < errors.length) throw new ValidationError(errors);
+}
+
 function validateIndexShape(index) {
   if (!index || !Array.isArray(index.epics) || !Array.isArray(index.tasks)) {
     throw new Error(`Invalid index shape: ${CONFIG.INDEX_FILE}`);
@@ -298,14 +345,21 @@ function outputValidationError(validationError) {
 
 function buildIndex(options) {
   const epicFiles = walkMarkdownFiles(CONFIG.EPIC_DIR);
+  const fsFiles = walkMarkdownFiles(CONFIG.FEATURE_SLICE_DIR);
   const taskFiles = walkMarkdownFiles(CONFIG.TASK_DIR);
 
   logVerbose(`Found ${epicFiles.length} Epic markdown file(s).`);
+  logVerbose(`Found ${fsFiles.length} FeatureSlice markdown file(s).`);
   logVerbose(`Found ${taskFiles.length} Task markdown file(s).`);
 
   const epics = epicFiles.map((file) => {
     logVerbose(`Parsing Epic: ${file}`);
     return parseEpicFile(file);
+  }).filter((v) => !!v);
+
+  const FeatureSlices = fsFiles.map((file) => {
+    logVerbose(`Parsing FeatureSlice: ${file}`);
+    return parseFeatureSliceFile(file);
   }).filter((v) => !!v);
 
   const tasks = taskFiles.map((file) => {
@@ -314,12 +368,15 @@ function buildIndex(options) {
   }).filter((v) => !!v);
 
   ensureUniqueIds(epics, 'Epic');
+  ensureUniqueIds(FeatureSlices, 'FeatureSlice');
   ensureUniqueIds(tasks, 'Task');
   validateEpicReferences(epics, tasks);
+  validateFeatureSliceReferences(epics, FeatureSlices, tasks);
 
   return {
     generated_at: new Date().toISOString(),
     epics,
+    feature_slices: FeatureSlices,
     tasks
   };
 }
@@ -328,15 +385,20 @@ function updateIndex(options) {
   const index = buildIndex(options);
   writeJson(CONFIG.INDEX_FILE, index);
   logSuccess(`Index updated: ${CONFIG.INDEX_FILE}`);
-  logInfo(`Indexed ${index.epics.length} Epic(s), ${index.tasks.length} Task(s).`);
+  logInfo(`Indexed ${index.epics.length} Epic(s), ${index.feature_slices.length} FeatureSlice(s), ${index.tasks.length} Task(s).`);
 }
 
 function loadValidatedIndex() {
   const index = readIndex();
   validateIndexShape(index);
+  if (!Array.isArray(index.feature_slices)) index.feature_slices = [];
+
   ensureUniqueIds(index.epics, 'Epic');
+  ensureUniqueIds(index.feature_slices, 'FeatureSlice');
   ensureUniqueIds(index.tasks, 'Task');
   validateEpicReferences(index.epics, index.tasks);
+  validateFeatureSliceReferences(index.epics, index.feature_slices, index.tasks);
+
   return index;
 }
 
@@ -344,7 +406,7 @@ function checkIndexFileStaled() {
   const indexStat = fs.statSync(CONFIG.INDEX_FILE);
   const indexMtime = indexStat.mtimeMs;
 
-  const dirs = [CONFIG.EPIC_DIR, CONFIG.TASK_DIR];
+  const dirs = [CONFIG.EPIC_DIR, CONFIG.TASK_DIR, CONFIG.FEATURE_SLICE_DIR];
   for (const dir of dirs) {
     if (!fs.existsSync(dir)) continue;
     const files = fs.readdirSync(dir);
@@ -432,9 +494,17 @@ function printEpic(epic) {
   console.log(`📦 ${color(epic.id, 'bold')} ${statusLabel(epic.status)} ${color(epic.updated_at, 'gray')} ${epic.path} ${title}`);
 }
 
+function printFeatureSlice(fs, showEpicPart = true, indent = '') {
+  const title = trimString(fs.title);
+  const epicPart = fs.epic_id ? color(` epic:${fs.epic_id}`, 'gray') : color(' no-epic', 'gray');
+  console.log(`${indent}📚 ${color(fs.id, 'bold')} ${statusLabel(fs.status)} ${color(fs.updated_at, 'gray')}${showEpicPart ? epicPart : ''} ${fs.path} ${title}`);
+}
+
 function printTask(task, showEpicPart = true, indent = '') {
   const title = trimString(task.title);
-  const epicPart = task.epic_id ? color(` epic:${task.epic_id}`, 'gray') : color(' no-epic', 'gray');
+  let epicPart = color(' no-epic', 'gray');
+  if (task.feature_slice_id) epicPart = color(` fs:${task.feature_slice_id}`, 'gray');
+  if (task.epic_id) epicPart = color(` epic:${task.epic_id}`, 'gray');
   console.log(`${indent}📝 ${color(task.id, 'bold')} ${statusLabel(task.status)} ${color(task.updated_at, 'gray')}${showEpicPart ? epicPart : ''} ${task.path} ${title}`);
 }
 
@@ -454,6 +524,22 @@ function listEpics(options) {
   epics.forEach(printEpic);
 }
 
+function listFeatureSlices(options){
+  const index = loadValidatedIndex();
+  const featureSlices = (index.feature_slices||[])
+    .filter((fs) => isVisibleByDoneStatus(fs, options.withDone))
+    .sort(sortByUpdatedThenId);
+
+  logVerbose(`Displaying ${featureSlices.length} FeatureSlice(s).`);
+
+  if (featureSlices.length === 0){
+    logWarning('No FeatureSlice matched.');
+    return;
+  }
+
+  featureSlices.forEach((v) => printFeatureSlice(v));
+}
+
 function listTasks(options) {
   const index = loadValidatedIndex();
   let tasks = index.tasks.filter((task) => isVisibleByDoneStatus(task, options.withDone));
@@ -462,8 +548,12 @@ function listTasks(options) {
     tasks = tasks.filter((task) => task.epic_id === options.epic);
   }
 
-  if (options.noEpic) {
-    tasks = tasks.filter((task) => !task.epic_id);
+  if (options.featureSlice){
+    tasks = tasks.filter((task) => task.feature_slice_id === options.featureSlice);
+  }
+
+  if (options.noParent) {
+    tasks = tasks.filter((task) => !task.epic_id && !task.feature_slice_id);
   }
 
   tasks = tasks.sort(sortByUpdatedThenId);
@@ -484,44 +574,68 @@ function printTree(options) {
     .filter((epic) => isVisibleByDoneStatus(epic, options.withDone))
     .sort((a, b) => String(a.id).localeCompare(String(b.id)));
 
+  const visibleFss = (index.feature_slices||[])
+    .filter((fs) => isVisibleByDoneStatus(fs, options.withDone))
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+
   const visibleTasks = index.tasks
     .filter((task) => isVisibleByDoneStatus(task, options.withDone))
     .sort((a, b) => String(a.id).localeCompare(String(b.id)));
 
   const tasksByEpic = new Map();
-  const noEpicTasks = [];
+  const fsByEpic = new Map();
+  const noParentTasks = [];
 
   for (const task of visibleTasks) {
     if (task.epic_id) {
       if (!tasksByEpic.has(task.epic_id)) tasksByEpic.set(task.epic_id, []);
       tasksByEpic.get(task.epic_id).push(task);
-    } else {
-      noEpicTasks.push(task);
+    } else if (!task.feature_slice_id) {
+      noParentTasks.push(task);
     }
   }
 
-  logVerbose(`Displaying tree with ${visibleEpics.length} Epic(s) and ${visibleTasks.length} Task(s).`);
+  for(const fs of visibleFss){
+    if(!fsByEpic.has(fs.epic_id)) fsByEpic.set(fs.epic_id, []);
+    fsByEpic.get(fs.epic_id).push(fs);
+  }
 
-  if (visibleEpics.length === 0 && noEpicTasks.length === 0) {
-    logWarning('No Epic or Task matched the current filters.');
+  logVerbose(`Displaying tree with ${visibleEpics.length} Epic(s), ${visibleFss.length} FeatureSlice(s), ${visibleTasks.length} Task(s).`);
+
+  if (visibleEpics.length === 0 && noParentTasks.length === 0) {
+    logWarning('No Epics, FeatureSlices, or Tasks matched the current filters.');
     return;
   }
 
+  const getBranchChar = (listItems, index) => (index === listItems.length - 1) ? '└─' : '├─';
+  const getOuterBranchChar = (listItems, index) => (index === listItems.length - 1) ? '  ' : '│ ';
+
   for (const epic of visibleEpics) {
     printEpic(epic);
-    const children = tasksByEpic.get(epic.id) || [];
-    children.forEach((task, index) => {
-      const branch = index === children.length - 1 ? '└─' : '├─';
-      printTask(task, false, `  ${branch} `);
+
+    const fss = fsByEpic.get(epic.id) || [];
+    const directTasks = visibleTasks.filter(task => task.epic_id === epic.id);
+    const fssAndDirectTasks = [...fss, ...directTasks];
+
+    fss.forEach((fs, index) => {
+      printFeatureSlice(fs, false, `  ${getBranchChar(fssAndDirectTasks, index)} `);
+      const outerBranch = getOuterBranchChar(fssAndDirectTasks, index);
+      const children = visibleTasks.filter(task => task.feature_slice_id === fs.id);
+      children.forEach((task, index) => {
+        printTask(task, false, `  ${outerBranch}  ${getBranchChar(children, index)} `);
+      });
+    });
+
+    directTasks.forEach((task, index) => {
+      printTask(task, false, `  ${getBranchChar(directTasks, index)} `);
     });
     console.log('');
   }
 
-  if (noEpicTasks.length > 0) {
+  if (noParentTasks.length > 0) {
     console.log(`📦 ${color('No Epic', 'bold')}`);
-    noEpicTasks.forEach((task, index) => {
-      const branch = index === noEpicTasks.length - 1 ? '└─' : '├─';
-      printTask(task, false, `  ${branch} `);
+    noParentTasks.forEach((task, index) => {
+      printTask(task, false, `  ${getBranchChar(noParentTasks, index)} `);
     });
   }
 }
@@ -540,6 +654,7 @@ Usage:
 Commands:
   update-index         Read Markdown files and update ${CONFIG.INDEX_FILE}
   list-epics           List Epics
+  list-feature-slices  List FeatureSlices
   list-tasks           List Tasks
   tree                 Show Epic / Task tree
   help                 Show help
@@ -547,7 +662,8 @@ Commands:
 Options:
   --with-done          Include items with status 'done'
   --epic <EPIC_ID>     Filter Tasks by Epic ID
-  --no-epic            Show only Tasks without an Epic
+  --feature-slice <ID> Filter Tasks by FeatureSlice
+  --no-parent          Show only Tasks without parent
   --verbose            Show verbose logs
   --help, -h           Show help
 
@@ -557,8 +673,10 @@ Statuses:
 Examples:
   node agent-task.js update-index
   node agent-task.js list-epics
+  node agent-task.js list-feature-slices
   node agent-task.js list-tasks --epic EPIC-001
-  node agent-task.js list-tasks --no-epic
+  node agent-task.js list-tasks --feature-slice FS-001
+  node agent-task.js list-tasks --no-parent
   node agent-task.js tree --with-done
 `);
 }
@@ -572,6 +690,7 @@ function main() {
     'update-index': updateIndex,
     'list-epics': listEpics,
     'list-tasks': listTasks,
+    'list-feature-slices': listFeatureSlices,
     'tree': printTree,
   };
   try {
